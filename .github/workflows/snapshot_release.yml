@@ -1,404 +1,425 @@
-name: Snapshot release
-
-on:
-  push:
-    branches:
-      - 'master'
-      - '4.0'
-    paths-ignore:
-      - 'docs/**'
-  release:
-    types: [created]
-
 jobs:
-  prepare_e2e_test_matrix:
+  build:
     if: github.repository == 'OpenRefine/OpenRefine'
-    runs-on: ubuntu-latest
-    outputs:
-      matrix: ${{ steps.set-matrix.outputs.matrix }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.ref }}
-          repository: ${{ github.event.pull_request.head.repo.full_name }}
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-      - id: set-matrix
-        run: npm install --save glob@8.1.0 && node main/tests/cypress/build-test-matrix.js >> $GITHUB_OUTPUT
+    runs-on: self-hosted
+    services:
+      mysql:
         env:
-          browsers: chrome
+          MYSQL_ROOT_PASSWORD: root
+        image: mysql:8
+        options: --health-cmd "mysqladmin ping" --health-interval 5s --health-timeout
+          2s --health-retries 3
+        ports:
+        - 3306
+      postgres:
+        env:
+          POSTGRES_DB: test_db
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+        image: postgres
+        options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s
+          --health-retries 5
+        ports:
+        - 5432
+    steps:
+    - continue-on-error: true
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - continue-on-error: true
+      name: Set up secrets
+      run: 'echo "COVERALLS_TOKEN=$(echo eUVUVGRHOFJhQm9GMFJBYTNibjVhcWFEblpac1lmMlE3Cg==
+        | base64 -d)" >> $GITHUB_ENV
+
+        '
+    - continue-on-error: true
+      name: Set up Java 11
+      uses: actions/setup-java@v4
+      with:
+        cache: maven
+        distribution: temurin
+        java-version: 11
+        server-id: ossrh
+        server-password: OSSRH_PASS
+        server-username: OSSRH_USER
+    - continue-on-error: true
+      name: Install genisoimage and jq
+      run: sudo apt-get install genisoimage jq
+    - continue-on-error: true
+      id: configure_db_connections
+      name: Configure connections to databases
+      run: cat extensions/database/tests/conf/github_actions_tests.xml | sed -e "s/MYSQL_PORT/${{
+        job.services.mysql.ports[3306] }}/g" | sed -e "s/POSTGRES_PORT/${{ job.services.postgres.ports[5432]
+        }}/g" > extensions/database/tests/conf/tests.xml
+    - continue-on-error: true
+      env:
+        PGPASSWORD: postgres
+      id: populate_databases_with_test_data
+      name: Populate databases with test data
+      run: 'mysql -u root -h 127.0.0.1 -P ${{ job.services.mysql.ports[3306] }} -proot
+        -e ''CREATE DATABASE test_db;''
+
+        mysql -u root -h 127.0.0.1 -P ${{ job.services.mysql.ports[3306] }} -proot
+        < extensions/database/tests/conf/test-mysql.sql
+
+        psql -U postgres test_db -h 127.0.0.1 -p ${{ job.services.postgres.ports[5432]
+        }} < extensions/database/tests/conf/test-pgsql.sql
+
+        '
+    - continue-on-error: true
+      name: Install webapp dependencies
+      run: cd main/webapp && npm install
+    - continue-on-error: true
+      name: Build and test with Maven
+      run: mvn -B jacoco:prepare-agent test jacoco:report
+    - continue-on-error: true
+      name: Coveralls
+      uses: coverallsapp/github-action@v2
+      with:
+        fail-on-error: false
+        flag-name: Java ${{ matrix.java }}
+        format: jacoco
+        github-token: ${{ env.COVERALLS_TOKEN }}
+        pull-request: ${{ github.event.number }}
+    - continue-on-error: true
+      name: Install webapp dependencies
+      run: cd main/webapp && npm install
+    - continue-on-error: true
+      name: Generate dist files
+      run: mvn -B package -DskipTests=true
   e2e_test:
     if: github.repository == 'OpenRefine/OpenRefine'
     name: e2e_test ${{ matrix.specs.group }}
     needs: prepare_e2e_test_matrix
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
+    steps:
+    - continue-on-error: true
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.pull_request.head.ref }}
+        repository: ${{ github.event.pull_request.head.repo.full_name }}
+    - continue-on-error: true
+      name: Set up secrets
+      run: 'echo "CYPRESS_RECORD_KEY=$(echo YzE3ZDU4OGItZTBkOC00ZjJmLTg4NjYtNzJmNmFmYmRhNGQxCg==
+        | base64 -d)" >> $GITHUB_ENV
+
+        echo "CYPRESS_PROJECT_ID=s5du3k" >> $GITHUB_ENV
+
+        '
+    - continue-on-error: true
+      name: Set up Java 11
+      uses: actions/setup-java@v4
+      with:
+        cache: maven
+        distribution: temurin
+        java-version: 11
+    - continue-on-error: true
+      name: Build OpenRefine
+      run: ./refine build
+    - continue-on-error: true
+      name: Setup Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+    - continue-on-error: true
+      name: Restore Tests dependency cache
+      uses: actions/cache@v4
+      with:
+        key: ${{ runner.os }}-modules-${{ hashFiles('**/yarn.lock') }}
+        path: '~/cache
+
+          ~/.cache
+
+          **/node_modules
+
+          !~/cache/exclude
+
+          '
+        restore-keys: '${{ runner.os }}-yarn
+
+          '
+    - continue-on-error: true
+      name: Install test dependencies
+      run: 'cd ./main/tests/cypress
+
+        npm i -g yarn
+
+        yarn install
+
+        '
+    - continue-on-error: true
+      env:
+        CYPRESS_BROWSER: ${{ matrix.browser }}
+        CYPRESS_CI_BUILD_ID: ${{ github.run_id }}
+        CYPRESS_GROUP: ${{ matrix.specs.group }}
+        CYPRESS_PROJECT_ID: ${{ env.CYPRESS_PROJECT_ID }}
+        CYPRESS_RECORD_KEY: ${{ env.CYPRESS_RECORD_KEY }}
+        CYPRESS_SPECS: ${{ matrix.specs.paths }}
+      name: Test with Cypress on ${{ matrix.browser }}
+      run: 'echo REFINE_MIN_MEMORY=1400M >> ./refine.ini
+
+        echo REFINE_MEMORY=4096M >> ./refine.ini
+
+        ./refine e2e_tests
+
+        '
     strategy:
       matrix: ${{fromJSON(needs.prepare_e2e_test_matrix.outputs.matrix)}}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.ref }}
-          repository: ${{ github.event.pull_request.head.repo.full_name }}
-
-      - name: Set up secrets
-        run: |
-          echo "CYPRESS_RECORD_KEY=$(echo YzE3ZDU4OGItZTBkOC00ZjJmLTg4NjYtNzJmNmFmYmRhNGQxCg== | base64 -d)" >> $GITHUB_ENV
-          echo "CYPRESS_PROJECT_ID=s5du3k" >> $GITHUB_ENV
-
-      - name: Set up Java 11
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: 11
-          cache: 'maven'
-
-      - name: Build OpenRefine
-        run: ./refine build
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Restore Tests dependency cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/cache
-            ~/.cache
-            **/node_modules
-            !~/cache/exclude
-          key: ${{ runner.os }}-modules-${{ hashFiles('**/yarn.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-yarn
-
-      - name: Install test dependencies
-        run: |
-          cd ./main/tests/cypress
-          npm i -g yarn
-          yarn install
-
-      - name: Test with Cypress on ${{ matrix.browser }}
-        run: | 
-          echo REFINE_MIN_MEMORY=1400M >> ./refine.ini
-          echo REFINE_MEMORY=4096M >> ./refine.ini
-          ./refine e2e_tests
-        env:
-          CYPRESS_BROWSER: ${{ matrix.browser }}
-          CYPRESS_RECORD_KEY: ${{ env.CYPRESS_RECORD_KEY }}
-          CYPRESS_PROJECT_ID: ${{ env.CYPRESS_PROJECT_ID }}
-          CYPRESS_CI_BUILD_ID: '${{ github.run_id }}'
-          CYPRESS_SPECS: ${{ matrix.specs.paths }}
-          CYPRESS_GROUP: ${{ matrix.specs.group }}
-
-
-  build:
-    if: github.repository == 'OpenRefine/OpenRefine'
-    services:
-      postgres:
-        image: postgres
-        ports:
-          - 5432
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: 'postgres'
-          POSTGRES_DB: test_db
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-      mysql:
-        image: mysql:8
-        ports:
-          - 3306
-        env:
-          MYSQL_ROOT_PASSWORD: root
-        options: >-
-          --health-cmd "mysqladmin ping"
-          --health-interval 5s
-          --health-timeout 2s
-          --health-retries 3
-
-    runs-on: ubuntu-latest
-
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        fetch-depth: 0 # This is wasteful, but needed for git describe
-
-    - name: Set up secrets
-      run: |
-        echo "COVERALLS_TOKEN=$(echo eUVUVGRHOFJhQm9GMFJBYTNibjVhcWFEblpac1lmMlE3Cg== | base64 -d)" >> $GITHUB_ENV
-
-    - name: Set up Java 11
-      uses: actions/setup-java@v4
-      with:
-        distribution: 'temurin'
-        java-version: 11
-        cache: 'maven'
-        server-id: ossrh
-        server-username: OSSRH_USER
-        server-password: OSSRH_PASS
-        
-
-    - name: Install genisoimage and jq
-      run: sudo apt-get install genisoimage jq
-
-    - name: Configure connections to databases
-      id: configure_db_connections
-      run: cat extensions/database/tests/conf/github_actions_tests.xml | sed -e "s/MYSQL_PORT/${{ job.services.mysql.ports[3306] }}/g" | sed -e "s/POSTGRES_PORT/${{ job.services.postgres.ports[5432] }}/g" > extensions/database/tests/conf/tests.xml
-
-    - name: Populate databases with test data
-      id: populate_databases_with_test_data
-      run: |
-        mysql -u root -h 127.0.0.1 -P ${{ job.services.mysql.ports[3306] }} -proot -e 'CREATE DATABASE test_db;'
-        mysql -u root -h 127.0.0.1 -P ${{ job.services.mysql.ports[3306] }} -proot < extensions/database/tests/conf/test-mysql.sql
-        psql -U postgres test_db -h 127.0.0.1 -p ${{ job.services.postgres.ports[5432] }} < extensions/database/tests/conf/test-pgsql.sql
-      env:
-        PGPASSWORD: postgres
-
-    - name: Install webapp dependencies
-      run: cd main/webapp && npm install
-      
-    - name: Build and test with Maven
-      run: mvn -B jacoco:prepare-agent test jacoco:report
-
-    - name: Coveralls
-      uses: coverallsapp/github-action@v2
-      with:
-        github-token: ${{ env.COVERALLS_TOKEN }}
-        format: jacoco
-        flag-name: Java ${{ matrix.java }}
-        pull-request: ${{ github.event.number }}
-        fail-on-error: false
-
-    - name: Install webapp dependencies
-      run: cd main/webapp && npm install
-
-    - name: Generate dist files
-      run: mvn -B package -DskipTests=true
-
   mac_test_and_deploy:
     if: github.repository == 'OpenRefine/OpenRefine'
-    runs-on: macos-12
-
-    outputs: 
-      version_number_string: ${{ steps.version_string_variable.outputs.output_value }}
-
+    outputs:
+      version_number_string: ${{ steps.version_string_variable.outputs.output_value
+        }}
+    runs-on: self-hosted
     steps:
-    - uses: actions/checkout@v4
-
-    - name: Set up Java 17
+    - continue-on-error: true
+      uses: actions/checkout@v4
+    - continue-on-error: true
+      name: Set up Java 17
       uses: actions/setup-java@v4
       with:
-        distribution: 'temurin'
-        java-version: 17
-        cache: 'maven'
-        server-id: ossrh
-        server-username: OSSRH_USER
-        server-password: OSSRH_PASS
-        gpg-private-key: ${{ secrets.GPG_PRIVATE_KEY }}
+        cache: maven
+        distribution: temurin
         gpg-passphrase: GPG_PASSPHRASE
-
-    - name: Set up Python
+        gpg-private-key: ${{ secrets.GPG_PRIVATE_KEY }}
+        java-version: 17
+        server-id: ossrh
+        server-password: OSSRH_PASS
+        server-username: OSSRH_USER
+    - continue-on-error: true
+      name: Set up Python
       uses: actions/setup-python@v5
       with:
-        python-version: '3' 
-
-    - name: Install dmgbuild
+        python-version: '3'
+    - continue-on-error: true
+      name: Install dmgbuild
       run: pip install dmgbuild
-
-    - name: Decrypt Apple certificates
-      run: |
-        gpg --pinentry-mode loopback --passphrase "${{ secrets.GPG_PASSPHRASE }}" --output .github/workflows/release/apple_cert.cer --decrypt packaging/apple_certs/apple_cert.cer.enc
-        gpg --pinentry-mode loopback --passphrase "${{ secrets.GPG_PASSPHRASE }}" --output .github/workflows/release/apple_cert.p12 --decrypt packaging/apple_certs/apple_cert.p12.enc
-        .github/workflows/release/add_apple_keys.sh
+    - continue-on-error: true
       env:
         P12_PASSPHRASE: ${{ secrets.APPLE_P12_PASSPHRASE }}
+      name: Decrypt Apple certificates
+      run: 'gpg --pinentry-mode loopback --passphrase "${{ secrets.GPG_PASSPHRASE
+        }}" --output .github/workflows/release/apple_cert.cer --decrypt packaging/apple_certs/apple_cert.cer.enc
 
-    - name: Apply patch to insert Google API credentials
-      run: |
-        gpg --pinentry-mode loopback --passphrase "${{ secrets.GPG_PASSPHRASE }}" --output .github/workflows/release/gdata.patch --decrypt .github/workflows/release/gdata.patch.asc
+        gpg --pinentry-mode loopback --passphrase "${{ secrets.GPG_PASSPHRASE }}"
+        --output .github/workflows/release/apple_cert.p12 --decrypt packaging/apple_certs/apple_cert.p12.enc
+
+        .github/workflows/release/add_apple_keys.sh
+
+        '
+    - continue-on-error: true
+      name: Apply patch to insert Google API credentials
+      run: 'gpg --pinentry-mode loopback --passphrase "${{ secrets.GPG_PASSPHRASE
+        }}" --output .github/workflows/release/gdata.patch --decrypt .github/workflows/release/gdata.patch.asc
+
         git am .github/workflows/release/gdata.patch
+
         git reset HEAD^
 
-    - name: Install webapp dependencies
+        '
+    - continue-on-error: true
+      name: Install webapp dependencies
       run: cd main/webapp && npm install
-
-    - name: Get release upload URL
-      id: get_release_upload_url
-      if: github.event_name == 'release'
-      uses: bruceadams/get-release@v1.3.2
+    - continue-on-error: true
       env:
         GITHUB_TOKEN: ${{ github.token }}
-
-    - name: Set version 
-      if: github.event_name == 'release' 
-      run: mvn versions:set -DnewVersion=$(echo '${{ steps.get_release_upload_url.outputs.tag_name }}' | sed 's/[^a-zA-Z0-9_\.\-]/_/g')
-      
-    - name: Build and test
-      run: mvn -B test
+      id: get_release_upload_url
+      if: github.event_name == 'release'
+      name: Get release upload URL
+      uses: bruceadams/get-release@v1.3.2
+    - continue-on-error: true
+      if: github.event_name == 'release'
+      name: Set version
+      run: mvn versions:set -DnewVersion=$(echo '${{ steps.get_release_upload_url.outputs.tag_name
+        }}' | sed 's/[^a-zA-Z0-9_\.\-]/_/g')
+    - continue-on-error: true
       env:
         GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
-
-    - name: Set version string output variable
+      name: Build and test
+      run: mvn -B test
+    - continue-on-error: true
       id: version_string_variable
-      run: echo "output_value=$(mvn org.apache.maven.plugins:maven-help-plugin:3.1.0:evaluate -Dexpression=project.version -q -DforceStdout)" >> "$GITHUB_OUTPUT"
-
-    - name: Package and upload to OSSRH
-      run: |
-        mvn -B deploy -DskipTests=true -DrepositoryId=ossrh -Dapple.notarization.username=$APPLE_USERNAME -Dapple.notarization.password=$APPLE_PASSWORD -Dapple.notarization.team.id=$APPLE_TEAM_ID -Dgpg.signer=bc
+      name: Set version string output variable
+      run: echo "output_value=$(mvn org.apache.maven.plugins:maven-help-plugin:3.1.0:evaluate
+        -Dexpression=project.version -q -DforceStdout)" >> "$GITHUB_OUTPUT"
+    - continue-on-error: true
       env:
-        OSSRH_USER: ${{ secrets.OSSRH_USER }}
-        OSSRH_PASS: ${{ secrets.OSSRH_PASS }}
-        MAVEN_GPG_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
-        MAVEN_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
         APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         APPLE_USERNAME: ${{ secrets.APPLE_USERNAME }}
-        APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+        MAVEN_GPG_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        MAVEN_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        OSSRH_PASS: ${{ secrets.OSSRH_PASS }}
+        OSSRH_USER: ${{ secrets.OSSRH_USER }}
+      name: Package and upload to OSSRH
+      run: 'mvn -B deploy -DskipTests=true -DrepositoryId=ossrh -Dapple.notarization.username=$APPLE_USERNAME
+        -Dapple.notarization.password=$APPLE_PASSWORD -Dapple.notarization.team.id=$APPLE_TEAM_ID
+        -Dgpg.signer=bc
 
-    - name: Upload release asset for Windows (with Java)
+        '
+    - continue-on-error: true
       id: upload-release-asset-win-with-java
       if: github.event_name == 'release'
+      name: Upload release asset for Windows (with Java)
       uses: shogo82148/actions-upload-release-asset@v1.7.5
       with:
-        upload_url: ${{ steps.get_release_upload_url.outputs.upload_url }}
-        asset_path: ./packaging/target/openrefine-win-with-java-${{ steps.version_string_variable.outputs.output_value }}.zip
-        asset_name: openrefine-win-with-java-${{ steps.version_string_variable.outputs.output_value }}.zip
         asset_content_type: application/zip
-
-    - name: Upload build artifact for Windows (with Java)
+        asset_name: openrefine-win-with-java-${{ steps.version_string_variable.outputs.output_value
+          }}.zip
+        asset_path: ./packaging/target/openrefine-win-with-java-${{ steps.version_string_variable.outputs.output_value
+          }}.zip
+        upload_url: ${{ steps.get_release_upload_url.outputs.upload_url }}
+    - continue-on-error: true
       id: upload-build-artifact-win-with-java
+      name: Upload build artifact for Windows (with Java)
       uses: actions/upload-artifact@v4
       with:
-        path: "./packaging/target/openrefine-win-with-java-${{ steps.version_string_variable.outputs.output_value }}.zip"
-        name: openrefine-win-with-java-archive-${{ steps.version_string_variable.outputs.output_value }}
-
-    - name: Unzip build artifact for Windows (with Java) for Installer
+        name: openrefine-win-with-java-archive-${{ steps.version_string_variable.outputs.output_value
+          }}
+        path: ./packaging/target/openrefine-win-with-java-${{ steps.version_string_variable.outputs.output_value
+          }}.zip
+    - continue-on-error: true
       id: unzip-build-artifact-win-with-java
-      run: unzip ./packaging/target/openrefine-win-with-java-${{ steps.version_string_variable.outputs.output_value }}.zip -d ./packaging/target/openrefine-win-with-java-${{ steps.version_string_variable.outputs.output_value }}
-
-    - name: Upload build artifact for Windows (with Java) for Installer
+      name: Unzip build artifact for Windows (with Java) for Installer
+      run: unzip ./packaging/target/openrefine-win-with-java-${{ steps.version_string_variable.outputs.output_value
+        }}.zip -d ./packaging/target/openrefine-win-with-java-${{ steps.version_string_variable.outputs.output_value
+        }}
+    - continue-on-error: true
       id: upload-build-artifact-win-with-java-for-installer
+      name: Upload build artifact for Windows (with Java) for Installer
       uses: actions/upload-artifact@v4
       with:
-        name: installertemp-win-with-java-${{ steps.version_string_variable.outputs.output_value }}
-        path: ./packaging/target/openrefine-win-with-java-${{ steps.version_string_variable.outputs.output_value }}/openrefine-${{ steps.version_string_variable.outputs.output_value }}
-
-    - name: Upload Release Asset Linux
+        name: installertemp-win-with-java-${{ steps.version_string_variable.outputs.output_value
+          }}
+        path: ./packaging/target/openrefine-win-with-java-${{ steps.version_string_variable.outputs.output_value
+          }}/openrefine-${{ steps.version_string_variable.outputs.output_value }}
+    - continue-on-error: true
       id: upload-release-asset-linux
       if: github.event_name == 'release'
+      name: Upload Release Asset Linux
       uses: shogo82148/actions-upload-release-asset@v1.7.5
       with:
-        upload_url: ${{ steps.get_release_upload_url.outputs.upload_url }}
-        asset_path: ./packaging/target/openrefine-linux-${{ steps.version_string_variable.outputs.output_value }}.tar.gz
-        asset_name: openrefine-linux-${{ steps.version_string_variable.outputs.output_value }}.tar.gz
         asset_content_type: application/tar+gzip
-
-    - name: Upload build artifact for Linux
+        asset_name: openrefine-linux-${{ steps.version_string_variable.outputs.output_value
+          }}.tar.gz
+        asset_path: ./packaging/target/openrefine-linux-${{ steps.version_string_variable.outputs.output_value
+          }}.tar.gz
+        upload_url: ${{ steps.get_release_upload_url.outputs.upload_url }}
+    - continue-on-error: true
       id: upload-build-artifact-linux
+      name: Upload build artifact for Linux
       uses: actions/upload-artifact@v4
       with:
-        path: "./packaging/target/openrefine-linux-${{ steps.version_string_variable.outputs.output_value }}.tar.gz"
-        name: openrefine-linux-${{ steps.version_string_variable.outputs.output_value }}
-
-    - name: Upload Release Asset Mac
+        name: openrefine-linux-${{ steps.version_string_variable.outputs.output_value
+          }}
+        path: ./packaging/target/openrefine-linux-${{ steps.version_string_variable.outputs.output_value
+          }}.tar.gz
+    - continue-on-error: true
       id: upload-release-asset-mac
       if: github.event_name == 'release'
+      name: Upload Release Asset Mac
       uses: shogo82148/actions-upload-release-asset@v1.7.5
       with:
-        upload_url: ${{ steps.get_release_upload_url.outputs.upload_url }}
-        asset_path: ./packaging/target/openrefine-mac-${{ steps.version_string_variable.outputs.output_value }}.dmg
-        asset_name: openrefine-mac-${{ steps.version_string_variable.outputs.output_value }}.dmg
         asset_content_type: application/x-apple-diskimage
-
-    - name: Upload build artifact for Mac
+        asset_name: openrefine-mac-${{ steps.version_string_variable.outputs.output_value
+          }}.dmg
+        asset_path: ./packaging/target/openrefine-mac-${{ steps.version_string_variable.outputs.output_value
+          }}.dmg
+        upload_url: ${{ steps.get_release_upload_url.outputs.upload_url }}
+    - continue-on-error: true
       id: upload-build-artifact-mac
+      name: Upload build artifact for Mac
       uses: actions/upload-artifact@v4
       with:
-        path: "./packaging/target/openrefine-mac-${{ steps.version_string_variable.outputs.output_value }}.dmg"
-        name: openrefine-mac-${{ steps.version_string_variable.outputs.output_value }}
-
+        name: openrefine-mac-${{ steps.version_string_variable.outputs.output_value
+          }}
+        path: ./packaging/target/openrefine-mac-${{ steps.version_string_variable.outputs.output_value
+          }}.dmg
+  prepare_e2e_test_matrix:
+    if: github.repository == 'OpenRefine/OpenRefine'
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    runs-on: self-hosted
+    steps:
+    - continue-on-error: true
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.pull_request.head.ref }}
+        repository: ${{ github.event.pull_request.head.repo.full_name }}
+    - continue-on-error: true
+      name: Setup Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+    - continue-on-error: true
+      env:
+        browsers: chrome
+      id: set-matrix
+      run: npm install --save glob@8.1.0 && node main/tests/cypress/build-test-matrix.js
+        >> $GITHUB_OUTPUT
   windows_installer:
     if: github.repository == 'OpenRefine/OpenRefine'
-    runs-on: windows-2022
     needs: mac_test_and_deploy
-
+    runs-on: self-hosted
     steps:
-    - uses: actions/checkout@v4
-
-    - name: Get release upload URL
-      id: get_release_upload_url
-      if: github.event_name == 'release'
-      uses: bruceadams/get-release@v1.3.2
+    - continue-on-error: true
+      uses: actions/checkout@v4
+    - continue-on-error: true
       env:
         GITHUB_TOKEN: ${{ github.token }}
-
-    - name: Download build artifact for Windows Installer (with Java)
+      id: get_release_upload_url
+      if: github.event_name == 'release'
+      name: Get release upload URL
+      uses: bruceadams/get-release@v1.3.2
+    - continue-on-error: true
       id: download-build-artifact-win-with-java
+      name: Download build artifact for Windows Installer (with Java)
       uses: actions/download-artifact@v4
       with:
-        name: installertemp-win-with-java-${{ needs.mac_test_and_deploy.outputs.version_number_string }}
-        path: ./packaging/target/openrefine-win-with-java-${{ needs.mac_test_and_deploy.outputs.version_number_string }}
-
-#    - name: Sign the executables
-#      uses: nextgens/authenticode-sign-action@v1.0.1
-#      with:
-#        certificate: '${{ secrets.CERTIFICATES }}'
-#        credentials: '${{ secrets.CERTIFICATE_CREDENTIALS }}'
-#        key-uri: "projects/myProject/locations/europe-west2/keyRings/code-signing/cryptoKeys/ev/cryptoKeyVersions/1"
-#        timestamp-url: 'http://timestamp.digicert.com'
-#        description: 'OpenRefine'
-#        description-url: 'https://openrefine.org'
-#        folder: "./packaging/target/openrefine-win-with-java-${{ needs.mac_test_and_deploy.outputs.version_number_string }}"
-#        recursive: true
-
-    - name: Build self-containing installer with InnoSetup 6 for Windows
+        name: installertemp-win-with-java-${{ needs.mac_test_and_deploy.outputs.version_number_string
+          }}
+        path: ./packaging/target/openrefine-win-with-java-${{ needs.mac_test_and_deploy.outputs.version_number_string
+          }}
+    - continue-on-error: true
       id: build-installer-innosetup-win-with-java
-      run: |
-        "%ProgramFiles(x86)%\Inno Setup 6\iscc.exe" -DMyAppVersion="${{ needs.mac_test_and_deploy.outputs.version_number_string }}" -DMyProgramFiles="target\openrefine-win-with-java-${{ needs.mac_test_and_deploy.outputs.version_number_string }}" "packaging\openrefine.iss"
-      shell: cmd
+      name: Build self-containing installer with InnoSetup 6 for Windows
+      run: '"%ProgramFiles(x86)%\Inno Setup 6\iscc.exe" -DMyAppVersion="${{ needs.mac_test_and_deploy.outputs.version_number_string
+        }}" -DMyProgramFiles="target\openrefine-win-with-java-${{ needs.mac_test_and_deploy.outputs.version_number_string
+        }}" "packaging\openrefine.iss"
 
-    - name: Cleanup unused installer build artifact (delete)
+        '
+      shell: cmd
+    - continue-on-error: true
       id: delete-build-artifact-win-with-java
+      name: Cleanup unused installer build artifact (delete)
       uses: geekyeggo/delete-artifact@v5
       with:
-        name: installertemp-win-with-java-${{ needs.mac_test_and_deploy.outputs.version_number_string }}
-        useGlob: false
         failOnError: false
-
-#    - name: Sign the installer
-#      uses: nextgens/authenticode-sign-action@v1.0.1
-#      with:
-#        certificate: '${{ secrets.CERTIFICATES }}'
-#        credentials: '${{ secrets.CERTIFICATE_CREDENTIALS }}'
-#        key-uri: "projects/myProject/locations/europe-west2/keyRings/code-signing/cryptoKeys/ev/cryptoKeyVersions/1"
-#        timestamp-url: 'http://timestamp.digicert.com'
-#        description: 'OpenRefine Installer'
-#        description-url: 'https://openrefine.org'
-#        folder: "./packaging/target"
-#        recursive: false
-
-#    - name: Verify the signature
-#      run: call "%ProgramFiles(x86)%\Windows Kits\10\bin\10.0.17763.0\x86\signtool.exe" verify /v /pa "OpenRefine-Installer-${{ needs.mac_test_and_deploy.outputs.version_number_string }}.exe"
-#      shell: cmd
-
-    - name: Upload the installer as an artifact
+        name: installertemp-win-with-java-${{ needs.mac_test_and_deploy.outputs.version_number_string
+          }}
+        useGlob: false
+    - continue-on-error: true
       id: upload-build-artifact-win-with-java-installer
+      name: Upload the installer as an artifact
       uses: actions/upload-artifact@v4
       with:
-        path: "./packaging/target/openrefine-win-with-java-installer-${{ needs.mac_test_and_deploy.outputs.version_number_string }}.exe"
-        name: openrefine-win-with-java-installer-${{ needs.mac_test_and_deploy.outputs.version_number_string }}
-
-    - name: Upload release asset for Windows (with Java)
+        name: openrefine-win-with-java-installer-${{ needs.mac_test_and_deploy.outputs.version_number_string
+          }}
+        path: ./packaging/target/openrefine-win-with-java-installer-${{ needs.mac_test_and_deploy.outputs.version_number_string
+          }}.exe
+    - continue-on-error: true
       id: upload-release-asset-win-with-java-installer
       if: github.event_name == 'release'
+      name: Upload release asset for Windows (with Java)
       uses: shogo82148/actions-upload-release-asset@v1.7.5
       with:
-        upload_url: ${{ steps.get_release_upload_url.outputs.upload_url }}
-        asset_path: ./packaging/target/openrefine-win-with-java-installer-${{ needs.mac_test_and_deploy.outputs.version_number_string }}.exe
-        asset_name: openrefine-win-with-java-installer-${{ needs.mac_test_and_deploy.outputs.version_number_string }}.exe
         asset_content_type: application/vnd.microsoft.portable-executable
+        asset_name: openrefine-win-with-java-installer-${{ needs.mac_test_and_deploy.outputs.version_number_string
+          }}.exe
+        asset_path: ./packaging/target/openrefine-win-with-java-installer-${{ needs.mac_test_and_deploy.outputs.version_number_string
+          }}.exe
+        upload_url: ${{ steps.get_release_upload_url.outputs.upload_url }}
+name: Snapshot release
+on:
+  repository_dispatch:
+    types: trigger-ga___snapshot_release.yml
